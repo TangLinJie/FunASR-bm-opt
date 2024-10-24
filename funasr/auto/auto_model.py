@@ -333,15 +333,8 @@ class AutoModel:
         return asr_result_list
 
     def inference_with_vad(self, input, input_len=None, **cfg):
+        st = time.time()
         kwargs = self.kwargs
-        # step.1: compute the vad model
-        deep_update(self.vad_kwargs, cfg)
-        beg_vad = time.time()
-        res = self.inference(input, input_len=input_len, model=self.vad_model, kwargs=self.vad_kwargs, **cfg)
-        end_vad = time.time()
-
-
-        # step.2 compute asr model
         model = self.model
         deep_update(kwargs, cfg)
         batch_size = max(int(kwargs.get("batch_size_s", 300))*1000, 1)
@@ -351,15 +344,27 @@ class AutoModel:
         key_list, data_list = prepare_data_iterator(input, input_len=input_len, data_type=kwargs.get("data_type", None))
         results_ret_list = []
         time_speech_total_all_samples = 1e-6
+        speechs = []
+        fs = kwargs["frontend"].fs if hasattr(kwargs["frontend"], "fs") else 16000
+        for input_i in data_list:
+            speech = load_audio_text_image_video(input_i, fs=fs, audio_fs=kwargs.get("fs", 16000))
+            speechs.append(speech)
+        print("load files cost: ", time.time() - st)
+        # step.1: compute the vad model
+        deep_update(self.vad_kwargs, cfg)
+        beg_vad = time.time()
+        res = self.inference(speechs, input_len=input_len, model=self.vad_model, kwargs=self.vad_kwargs, **cfg)
+        end_vad = time.time()
+        print("vad total cost: ", end_vad - beg_vad)
+        # step.2 compute asr model
 
         beg_total = time.time()
         pbar_total = tqdm(colour="red", total=len(res), dynamic_ncols=True) if not kwargs.get("disable_pbar", False) else None
         for i in range(len(res)):
+            st = time.time()
             key = res[i]["key"]
             vadsegments = res[i]["value"]
-            input_i = data_list[i]
-            fs = kwargs["frontend"].fs if hasattr(kwargs["frontend"], "fs") else 16000
-            speech = load_audio_text_image_video(input_i, fs=fs, audio_fs=kwargs.get("fs", 16000))
+            speech = speechs[i]
             speech_lengths = len(speech)
             n = len(vadsegments)
             data_with_index = [(vadsegments[i], i) for i in range(n)]
@@ -382,8 +387,12 @@ class AutoModel:
             # pbar_sample = tqdm(colour="blue", total=n, dynamic_ncols=True)
 
             all_segments = []
+            print("vad res sorted cost: ", time.time() - st)
+            times = 0
+            asr_st = time.time()
             for j, _ in enumerate(range(0, n)):
                 # pbar_sample.update(1)
+                st = time.time()
                 batch_size_ms_cum += (sorted_data[j][0][1] - sorted_data[j][0][0])
                 if j < n - 1 and (
                     batch_size_ms_cum + sorted_data[j + 1][0][1] - sorted_data[j + 1][0][0]) < batch_size and (
@@ -393,7 +402,11 @@ class AutoModel:
                 batch_size_ms_cum = 0
                 end_idx = j + 1
                 speech_j, speech_lengths_j = slice_padding_audio_samples(speech, speech_lengths, sorted_data[beg_idx:end_idx])
+                print("audio data split by vad, split id {} cost: ".format(j), time.time() - st)
+                st = time.time()
                 results = self.inference(speech_j, input_len=None, model=model, kwargs=kwargs, **cfg)
+                times += 1
+                print("asr infer split id {} cost: ".format(j), time.time() - st)
                 if self.spk_model is not None:
                     # compose vad segments: [[start_time_sec, end_time_sec, speech], [...]]
                     for _b in range(len(speech_j)):
@@ -409,6 +422,7 @@ class AutoModel:
                 if len(results) < 1:
                     continue
                 results_sorted.extend(results)
+            print("asr all cost: ", time.time() - asr_st, times)
 
             # end_asr_total = time.time()
             # time_escape_total_per_sample = end_asr_total - beg_asr_total
@@ -452,6 +466,7 @@ class AutoModel:
 
             return_raw_text = kwargs.get('return_raw_text', False)
             # step.3 compute punc model
+            st = time.time()
             if self.punc_model is not None:
                 if not len(result["text"]):
                     if return_raw_text:
@@ -464,6 +479,7 @@ class AutoModel:
                     result["text"] = punc_res[0]["text"]
             else:
                 raw_text = None
+            print("punc cost: ", time.time() - st)
 
             # speaker embedding cluster after resorted
             if self.spk_model is not None and kwargs.get('return_spk_res', True):

@@ -86,8 +86,8 @@ class ContextualParaformer(Paraformer):
             self.attn_loss = torch.nn.L1Loss()
         self.crit_attn_smooth = crit_attn_smooth
 
-        self.encoder_model = EngineOV("./bmodel/asr/encoder_f32.bmodel", device_id=kwargs['dev_id'])
-        self.decoder_model = EngineOV("./bmodel/asr/decoder_f32.bmodel", device_id=kwargs['dev_id'])
+        self.encoder_model = EngineOV("./bmodel/asr/encoder_bm1684x_f16_b10.bmodel", device_id=kwargs['dev_id'])
+        self.decoder_model = EngineOV("./bmodel/asr/decoder_bm1684x_f32.bmodel", device_id=kwargs['dev_id'])
 
     def forward(
         self,
@@ -319,6 +319,7 @@ class ContextualParaformer(Paraformer):
                  frontend=None,
                  **kwargs,
                  ):
+        st = time.time()
         # init beamsearch
         is_use_ctc = kwargs.get("decoding_ctc_weight", 0.0) > 0.00001 and self.ctc != None
         is_use_lm = kwargs.get("lm_weight", 0.0) > 0.00001 and kwargs.get("lm_file", None) is not None
@@ -333,7 +334,9 @@ class ContextualParaformer(Paraformer):
         time1 = time.perf_counter()
 
         audio_sample_list = load_audio_text_image_video(data_in, fs=frontend.fs, audio_fs=kwargs.get("fs", 16000))
+        print("asr inner: load audio cost: ", time.time() - st)
 
+        st = time.time()
         time2 = time.perf_counter()
         meta_data["load_data"] = f"{time2 - time1:0.3f}"
 
@@ -386,7 +389,11 @@ class ContextualParaformer(Paraformer):
         encoder_start = time.time()
         speech = speech.detach().numpy()
         speech_lengths = speech_lengths.detach().numpy()
+        print("asr inner: fbank get cost: ", time.time() - st)
+        st = time.time()
         encoder_output = self.encoder_model([speech, speech_lengths])
+        print("asr inner: encoder infer cost: ", time.time() - st)
+        st = time.time()
         encoder_end = time.time()
         enc, hidden, alphas, token_num = torch.from_numpy(encoder_output[0]), torch.from_numpy(encoder_output[1]), torch.from_numpy(encoder_output[2]), torch.from_numpy(encoder_output[3])
         if isinstance(enc, tuple):
@@ -424,6 +431,8 @@ class ContextualParaformer(Paraformer):
             _, (h_n, _) = self.bias_encoder(hw_embed)
             hw_embed = h_n.repeat(encoder_out.shape[0], 1, 1)
         predictor_end = time.time()  
+        print("asr inner: pt infer cost: ", time.time() - st)
+        st = time.time()
         decoder_output = self.decoder_model([enc.detach().numpy(), speech_lengths, acoustic_embeds.detach().numpy(), token_num.detach().numpy().astype(np.int32), hw_embed.detach().numpy()])
         decoder_out = torch.from_numpy(decoder_output[0])
         pre_token_length = token_num
@@ -435,6 +444,8 @@ class ContextualParaformer(Paraformer):
 
         results = []
         b, n, d = decoder_out.size()
+        print("asr inner: decoder infer cost: ", time.time() - st)
+        st = time.time()
         for i in range(b):
             x = encoder_out[i, :encoder_out_lens[i], :]
             am_scores = decoder_out[i, :pre_token_length[i], :]
@@ -488,6 +499,7 @@ class ContextualParaformer(Paraformer):
                 else:
                     result_i = {"key": key[i], "token_int": token_int}
                 results.append(result_i)
+        print("asr inner: post infer cost: ", time.time() - st)
         return results, meta_data
 
     def generate_hotwords_list(self, hotword_list_or_file, tokenizer=None, frontend=None):

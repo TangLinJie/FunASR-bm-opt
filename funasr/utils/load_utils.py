@@ -8,6 +8,7 @@ import librosa
 import torchaudio
 import time
 import logging
+import wave
 from torch.nn.utils.rnn import pad_sequence
 try:
     from funasr.download.file import download_from_url
@@ -58,13 +59,10 @@ def load_audio_text_image_video(data_or_path_or_list, fs: int = 16000, audio_fs:
             #     data_or_path_or_list, audio_fs = torchaudio.load(data_or_path_or_list)
             #     if kwargs.get("reduce_channels", True):
             #         data_or_path_or_list = data_or_path_or_list.mean(0)
-            try:
-                data_or_path_or_list, audio_fs = torchaudio.load(data_or_path_or_list)
-                if kwargs.get("reduce_channels", True):
-                    data_or_path_or_list = data_or_path_or_list.mean(0)
-            except:
-                data_or_path_or_list = _load_audio_ffmpeg(data_or_path_or_list, sr=fs)
-                data_or_path_or_list = torch.from_numpy(data_or_path_or_list).squeeze()  # [n_samples,]
+            data_or_path_or_list = _load_audio_ffmpeg(data_or_path_or_list, sr=fs)
+            data_or_path_or_list = torch.from_numpy(data_or_path_or_list).squeeze()  # [n_samples,]
+            # if kwargs.get("reduce_channels", True):
+            #     data_or_path_or_list = data_or_path_or_list.mean(0)
         elif data_type == "text" and tokenizer is not None:
             data_or_path_or_list = tokenizer.encode(data_or_path_or_list)
         elif data_type == "image": # undo
@@ -161,6 +159,7 @@ def _load_audio_ffmpeg(file: str, sr: int = 16000):
     # This launches a subprocess to decode audio while down-mixing
     # and resampling as necessary.  Requires the ffmpeg CLI in PATH.
     # fmt: off
+    """
     cmd = [
         "ffmpeg",
         "-nostdin",
@@ -175,6 +174,15 @@ def _load_audio_ffmpeg(file: str, sr: int = 16000):
     # fmt: on
     try:
         out = run(cmd, capture_output=True, check=True).stdout
+    except CalledProcessError as e:
+        raise RuntimeError(f"Failed to load audio: {e.stderr.decode()}") from e
+    """
+    try:
+        with wave.open(file, "rb") as wav_file:
+            params = wav_file.getparams()
+            fs = wav_file.getframerate()
+            frames = wav_file.readframes(wav_file.getnframes())
+            out = bytes(frames)
     except CalledProcessError as e:
         raise RuntimeError(f"Failed to load audio: {e.stderr.decode()}") from e
 

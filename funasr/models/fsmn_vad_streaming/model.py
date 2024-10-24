@@ -7,6 +7,8 @@ import os
 import json
 import time
 import math
+import multiprocessing
+import threading
 import torch
 from torch import nn
 from enum import Enum
@@ -287,7 +289,7 @@ class FsmnVADStreaming(nn.Module):
 		self.encoder = encoder
 		self.encoder_conf = encoder_conf
 
-		self.fsmn_model = EngineOV("./bmodel/fsmn/fsmn_f32.bmodel", device_id=kwargs['dev_id'])
+		self.fsmn_model = EngineOV("./bmodel/fsmn/fsmn_bm1684x_f32.bmodel", device_id=kwargs['dev_id'])
 
 
 	def ResetDetection(self, cache: dict = {}):
@@ -312,6 +314,7 @@ class FsmnVADStreaming(nn.Module):
 			cache["stats"].scores = cache["stats"].scores[:, real_drop_frames:, :]
 
 	def ComputeDecibel(self, cache: dict = {}) -> None:
+		st = time.time()
 		frame_sample_length = int(self.vad_opts.frame_length_ms * self.vad_opts.sample_rate / 1000)
 		frame_shift_length = int(self.vad_opts.frame_in_ms * self.vad_opts.sample_rate / 1000)
 		if cache["stats"].data_buf_all is None:
@@ -320,10 +323,60 @@ class FsmnVADStreaming(nn.Module):
 			cache["stats"].data_buf = cache["stats"].data_buf_all
 		else:
 			cache["stats"].data_buf_all = torch.cat((cache["stats"].data_buf_all, cache["stats"].waveform[0]))
+		print("vad ComputeDecibel cat cost: ", time.time() - st)
+
+		st = time.time()
+		"""
+		loop_times = math.ceil((cache["stats"].waveform.shape[1] - frame_sample_length + 1) / frame_shift_length)
+		if loop_times >= 8:
+			def _ComputeDecibel(queue, indx, times, waveform, offset, frame_sample_length, frame_shift_length):
+				for i in range(times):
+					offset += i * frame_shift_length
+					queue[indx] = 10 * math.log10((waveform[offset: offset + frame_sample_length]).square().sum() + \
+										0.000001)
+					indx += 1
+			# p = multiprocessing.Pool(8)
+			# queue = multiprocessing.Array('f', [0]*loop_times)
+			queue = [0]*loop_times
+			print("vad for init cost: ", time.time()-st)
+			compute_times_per_loop = loop_times // 8
+			last_times = loop_times % 8
+			threads = []
+			for i in range(7):
+				offset = i * compute_times_per_loop
+				# p.apply_async(_ComputeDecibel, args=(queue, offset, cache["stats"].waveform[0] \
+				# 			[offset * frame_shift_length: (offset + compute_times_per_loop - 1) * frame_shift_length + frame_sample_length], frame_sample_length, frame_shift_length))
+				thread = threading.Thread(target=_ComputeDecibel, args=(queue, offset, compute_times_per_loop, \
+							cache["stats"].waveform[0], offset * frame_shift_length, \
+							frame_sample_length, frame_shift_length))
+				thread.start()
+				threads.append(thread)
+			offset = 7 * compute_times_per_loop
+			# p.apply_async(_ComputeDecibel, args=(queue, offset, cache["stats"].waveform[0] \
+			# 			[offset * frame_shift_length:], frame_sample_length, frame_shift_length))
+			compute_times_per_loop = last_times + compute_times_per_loop
+			thread = threading.Thread(target=_ComputeDecibel, args=(queue, offset, compute_times_per_loop, \
+						cache["stats"].waveform[0], offset * frame_shift_length, \
+						frame_sample_length, frame_shift_length))
+			thread.start()
+			threads.append(thread)
+			# p.close()
+			# p.join()
+			for i in threads:
+				i.join()
+			print("process close")
+			cache["stats"].decibel.extend(list(queue))
+		else:
+			for offset in range(0, cache["stats"].waveform.shape[1] - frame_sample_length + 1, frame_shift_length):
+				cache["stats"].decibel.append(
+					10 * math.log10((cache["stats"].waveform[0][offset: offset + frame_sample_length]).square().sum() + \
+									0.000001))
+		"""
 		for offset in range(0, cache["stats"].waveform.shape[1] - frame_sample_length + 1, frame_shift_length):
 			cache["stats"].decibel.append(
 				10 * math.log10((cache["stats"].waveform[0][offset: offset + frame_sample_length]).square().sum() + \
 				                0.000001))
+		print("vad ComputeDecibel for cost: ", time.time() - st)
 
 	def ComputeScores(self, feats: torch.Tensor, cache: dict = {}) -> None:
 		#fsmn_start = time.time()
@@ -524,13 +577,19 @@ class FsmnVADStreaming(nn.Module):
 		# self.waveform = waveform  # compute decibel for each frame
 		cache["stats"].waveform = waveform
 		is_streaming_input = kwargs.get("is_streaming_input", True)
+		st = time.time()
 		self.ComputeDecibel(cache=cache)
+		print("vad forward ComputeDecibel cost: ", time.time() - st)
+		st = time.time()
 		self.ComputeScores(feats, cache=cache)
+		print("vad forward ComputeScores cost: ", time.time() - st)
 		#import pdb; pdb.set_trace() # neural networks in self.ComputeScores
+		st = time.time()
 		if not is_final:
 			self.DetectCommonFrames(cache=cache)
 		else:
 			self.DetectLastFrames(cache=cache)
+		print("vad forward DetectCommonFrames DetectLastFrames cost: ", time.time() - st)
 		segments = []
 		for batch_num in range(0, feats.shape[0]):  # only support batch_size = 1 now
 			segment_batch = []
@@ -603,6 +662,7 @@ class FsmnVADStreaming(nn.Module):
 	              **kwargs,
 	              ):
 
+		st = time.time()
 		if len(cache) == 0:
 			self.init_cache(cache, **kwargs)
 
@@ -614,6 +674,7 @@ class FsmnVADStreaming(nn.Module):
 		is_streaming_input = kwargs.get("is_streaming_input", False) if chunk_size >= 15000 else kwargs.get("is_streaming_input", True)
 		is_final = kwargs.get("is_final", False) if is_streaming_input else kwargs.get("is_final", True)
 		cfg = {"is_final": is_final, "is_streaming_input": is_streaming_input}
+		"""
 		audio_sample_list = load_audio_text_image_video(data_in,
 		                                                fs=frontend.fs,
 		                                                audio_fs=kwargs.get("fs", 16000),
@@ -621,6 +682,8 @@ class FsmnVADStreaming(nn.Module):
 		                                                tokenizer=tokenizer,
 		                                                cache=cfg,
 		                                                )
+		"""
+		audio_sample_list = data_in
 		#import pdb; pdb.set_trace()	# transform wav to torch.tensor
 		_is_final = cfg["is_final"]  # if data_in is a file or url, set is_final=True
 		is_streaming_input = cfg["is_streaming_input"]
@@ -628,12 +691,18 @@ class FsmnVADStreaming(nn.Module):
 		meta_data["load_data"] = f"{time2 - time1:0.3f}"
 		assert len(audio_sample_list) == 1, "batch_size must be set 1"
 
-		audio_sample = torch.cat((cache["prev_samples"], audio_sample_list[0]))
+		print("vad not cat cost: ", time.time() - st)
+		if cache["prev_samples"].shape[0] != 0:
+			audio_sample = torch.cat((cache["prev_samples"], audio_sample_list[0]))
+		else:
+			audio_sample = audio_sample_list[0]
 
 		n = int(len(audio_sample) // chunk_stride_samples + int(_is_final))
 		m = int(len(audio_sample) % chunk_stride_samples * (1 - int(_is_final)))
 		segments = []
+		print("vad init cost: ", time.time() - st)
 		for i in range(n):
+			st = time.time()
 			kwargs["is_final"] = _is_final and i == n - 1
 			audio_sample_i = audio_sample[i * chunk_stride_samples:(i + 1) * chunk_stride_samples]
 
@@ -655,10 +724,13 @@ class FsmnVADStreaming(nn.Module):
 				"cache": cache,
 				"is_streaming_input": is_streaming_input
 			}
+			print("vad split id {} fbank get cost: ".format(i), time.time() - st)
+			st = time.time()
 			segments_i = self.forward(**batch)
 			#import pdb; pdb.set_trace()
 			if len(segments_i) > 0:
 				segments.extend(*segments_i)
+			print("vad infer split id {} cost: ".format(i), time.time() - st)
 
 		cache["prev_samples"] = audio_sample[:-m]
 		if _is_final:

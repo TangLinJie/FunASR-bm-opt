@@ -4,6 +4,7 @@ from typing import Tuple
 import copy
 import numpy as np
 import torch
+import time
 import torch.nn as nn
 import torchaudio.compliance.kaldi as kaldi
 from torch.nn.utils.rnn import pad_sequence
@@ -69,6 +70,7 @@ def apply_lfr(inputs, lfr_m, lfr_n):
         else:  # process last LFR frame
             num_padding = lfr_m - (T - i * lfr_n)
             frame = (inputs[i * lfr_n:]).view(-1)
+            # print("num_padding: ", num_padding)
             for _ in range(num_padding):
                 frame = torch.hstack((frame, inputs[-1]))
             LFR_inputs.append(frame)
@@ -132,6 +134,7 @@ class WavFrontend(nn.Module):
             if self.upsacle_samples:
                 waveform = waveform * (1 << 15)
             waveform = waveform.unsqueeze(0)
+            # st = time.time()
             mat = kaldi.fbank(waveform,
                               num_mel_bins=self.n_mels,
                               frame_length=self.frame_length,
@@ -141,11 +144,16 @@ class WavFrontend(nn.Module):
                               window_type=self.window,
                               sample_frequency=self.fs,
                               snip_edges=self.snip_edges)
+            # print("fbank inner kaldi.fbank cost: ", time.time() - st)
 
             if self.lfr_m != 1 or self.lfr_n != 1:
+                # st = time.time()
                 mat = apply_lfr(mat, self.lfr_m, self.lfr_n)
+                # print("fbank inner apply_lfr cost: ", time.time() - st)
             if self.cmvn is not None:
+                # st = time.time()
                 mat = apply_cmvn(mat, self.cmvn)
+                # print("fbank inner apply_cmvn cost: ", time.time() - st)
             feat_length = mat.size(0)
             feats.append(mat)
             feats_lens.append(feat_length)
@@ -297,10 +305,12 @@ class WavFrontendOnline(nn.Module):
                 LFR_inputs.append((inputs[i * lfr_n:i * lfr_n + lfr_m]).view(1, -1))
             else:  # process last LFR frame
                 if is_final:
+                    # st = time.time()
                     num_padding = lfr_m - (T - i * lfr_n)
                     frame = (inputs[i * lfr_n:]).view(-1)
                     for _ in range(num_padding):
                         frame = torch.hstack((frame, inputs[-1]))
+                    # print("fbank apply_lfr for cost: ", time.time() - st)
                     LFR_inputs.append(frame)
                 else:
                     # update splice_idx and break the circle
@@ -343,6 +353,7 @@ class WavFrontendOnline(nn.Module):
                     waveform[:((frame_num - 1) * self.frame_shift_sample_length + self.frame_sample_length)])
                 waveform = waveform * (1 << 15)
                 waveform = waveform.unsqueeze(0)
+                # st = time.time()
                 mat = kaldi.fbank(waveform,
                                   num_mel_bins=self.n_mels,
                                   frame_length=self.frame_length,
@@ -351,6 +362,7 @@ class WavFrontendOnline(nn.Module):
                                   energy_floor=0.0,
                                   window_type=self.window,
                                   sample_frequency=self.fs)
+                # print("fbank inner kaldi.fbank cost: ", time.time() - st)
 
                 feat_length = mat.size(0)
                 feats.append(mat)
@@ -383,10 +395,14 @@ class WavFrontendOnline(nn.Module):
             if self.lfr_m != 1 or self.lfr_n != 1:
                 # update self.lfr_splice_cache in self.apply_lfr
                 # mat, self.lfr_splice_cache[i], lfr_splice_frame_idx = self.apply_lfr(mat, self.lfr_m, self.lfr_n, self.lfr_splice_cache[i],
+                # st = time.time()
                 mat, cache["lfr_splice_cache"][i], lfr_splice_frame_idx = self.apply_lfr(mat, self.lfr_m, self.lfr_n,
                                                                                      is_final)
+                # print("fbank apply_lfr cost: ", time.time() - st)
             if self.cmvn_file is not None:
+                # st = time.time()
                 mat = self.apply_cmvn(mat, self.cmvn)
+                # print("fbank apply_cmvn cost: ", time.time() - st)
             feat_length = mat.size(0)
             feats.append(mat)
             feats_lens.append(feat_length)
@@ -410,7 +426,9 @@ class WavFrontendOnline(nn.Module):
         batch_size = input.shape[0]
         assert batch_size == 1, 'we support to extract feature online only when the batch size is equal to 1 now'
         
+        # st = time.time()
         waveforms, feats, feats_lengths = self.forward_fbank(input, input_lengths, cache=cache)  # input shape: B T D
+        # print("fbank forward_fbank cost: ", time.time() - st)
         
         if feats.shape[0]:
 
@@ -427,7 +445,9 @@ class WavFrontendOnline(nn.Module):
                 frame_from_waveforms = int(
                     (cache["waveforms"].shape[1] - self.frame_sample_length) / self.frame_shift_sample_length + 1)
                 minus_frame = (self.lfr_m - 1) // 2 if cache["reserve_waveforms"].numel() == 0 else 0
+                # st = time.time()
                 feats, feats_lengths, lfr_splice_frame_idxs = self.forward_lfr_cmvn(feats, feats_lengths, is_final, cache=cache)
+                # print("fbank forward_lfr_cmvn cost: ", time.time() - st)
                 if self.lfr_m == 1:
                     cache["reserve_waveforms"] = torch.empty(0)
                 else:
@@ -448,7 +468,9 @@ class WavFrontendOnline(nn.Module):
                 cache["waveforms"] = waveforms if cache["reserve_waveforms"].numel() == 0 else cache["reserve_waveforms"]
                 feats = torch.stack(cache["lfr_splice_cache"])
                 feats_lengths = torch.zeros(batch_size, dtype=torch.int) + feats.shape[1]
+                # st = time.time()
                 feats, feats_lengths, _ = self.forward_lfr_cmvn(feats, feats_lengths, is_final, cache=cache)
+                # print("fbank forward_lfr_cmvn cost: ", time.time() - st)
         # if is_final:
         #     self.init_cache(cache)
         return feats, feats_lengths
