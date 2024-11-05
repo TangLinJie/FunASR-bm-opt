@@ -267,6 +267,10 @@ class WavFrontendOnline(nn.Module):
         self.cmvn = None if self.cmvn_file is None else load_cmvn(self.cmvn_file)
         # self.input_cache = None
         # self.lfr_splice_cache = []
+        # self.waveforms = None
+        # self.feats = None
+        # self.feats_lengths = None
+        # self.mat = None
 
     def output_size(self) -> int:
         return self.n_mels * self.lfr_m
@@ -300,6 +304,8 @@ class WavFrontendOnline(nn.Module):
         T = inputs.shape[0]  # include the right context
         T_lfr = int(np.ceil((T - (lfr_m - 1) // 2) / lfr_n))  # minus the right context: (lfr_m - 1) // 2
         splice_idx = T_lfr
+        # original code
+        """
         for i in range(T_lfr):
             if lfr_m <= T - i * lfr_n:
                 LFR_inputs.append((inputs[i * lfr_n:i * lfr_n + lfr_m]).view(1, -1))
@@ -320,6 +326,25 @@ class WavFrontendOnline(nn.Module):
         lfr_splice_cache = inputs[splice_idx:, :]
         LFR_outputs = torch.vstack(LFR_inputs)
         return LFR_outputs.type(torch.float32), lfr_splice_cache, splice_idx
+        """
+        feat_dim = inputs.shape[-1]
+        ori_inputs = inputs
+        strides = (lfr_n * feat_dim, 1)
+        sizes = (T_lfr, lfr_m * feat_dim)
+        last_idx = (T - lfr_m) // lfr_n + 1
+        num_padding = lfr_m - (T - last_idx * lfr_n)
+        if is_final:
+            if num_padding > 0:
+                num_padding = (2 * lfr_m - 2 * T + (T_lfr - 1 + last_idx) * lfr_n) / 2 * (T_lfr - last_idx)
+                inputs = torch.vstack([inputs] + [inputs[-1:]] * int(num_padding))
+        else:
+            if num_padding > 0:
+                sizes = (last_idx, lfr_m * feat_dim)
+                splice_idx = last_idx
+        splice_idx = min(T - 1, splice_idx * lfr_n)
+        LFR_outputs = inputs[:splice_idx].as_strided(sizes, strides)
+        lfr_splice_cache = ori_inputs[splice_idx:, :]
+        return LFR_outputs.clone().type(torch.float32), lfr_splice_cache, splice_idx
 
     @staticmethod
     def compute_frame_num(sample_length: int, frame_sample_length: int, frame_shift_sample_length: int) -> int:
@@ -354,14 +379,18 @@ class WavFrontendOnline(nn.Module):
                 waveform = waveform * (1 << 15)
                 waveform = waveform.unsqueeze(0)
                 # st = time.time()
-                mat = kaldi.fbank(waveform,
-                                  num_mel_bins=self.n_mels,
-                                  frame_length=self.frame_length,
-                                  frame_shift=self.frame_shift,
-                                  dither=self.dither,
-                                  energy_floor=0.0,
-                                  window_type=self.window,
-                                  sample_frequency=self.fs)
+                # if self.mat is None:
+                #     print("self.dither: ", self.dither)
+                #     print("self.window: ", self.window)
+                self.mat = kaldi.fbank(waveform,
+                                num_mel_bins=self.n_mels,
+                                frame_length=self.frame_length,
+                                frame_shift=self.frame_shift,
+                                dither=self.dither,
+                                energy_floor=0.0,
+                                window_type=self.window,
+                                sample_frequency=self.fs)
+                mat = self.mat
                 # print("fbank inner kaldi.fbank cost: ", time.time() - st)
 
                 feat_length = mat.size(0)
@@ -418,6 +447,7 @@ class WavFrontendOnline(nn.Module):
     def forward(
         self, input: torch.Tensor, input_lengths: torch.Tensor, **kwargs
     ):
+        all_st = time.time()
         is_final = kwargs.get("is_final", False)
         cache = kwargs.get("cache", {})
         if len(cache) == 0:
@@ -427,7 +457,12 @@ class WavFrontendOnline(nn.Module):
         assert batch_size == 1, 'we support to extract feature online only when the batch size is equal to 1 now'
         
         # st = time.time()
-        waveforms, feats, feats_lengths = self.forward_fbank(input, input_lengths, cache=cache)  # input shape: B T D
+        # if self.waveforms is None:
+        #     print("get")
+        self.waveforms, self.feats, self.feats_lengths = self.forward_fbank(input, input_lengths, cache=cache)  # input shape: B T D
+        waveforms = self.waveforms
+        feats = self.feats
+        feats_lengths = self.feats_lengths
         # print("fbank forward_fbank cost: ", time.time() - st)
         
         if feats.shape[0]:
@@ -473,6 +508,7 @@ class WavFrontendOnline(nn.Module):
                 # print("fbank forward_lfr_cmvn cost: ", time.time() - st)
         # if is_final:
         #     self.init_cache(cache)
+        print("frontend forward cost: ", time.time() - all_st)
         return feats, feats_lengths
 
 

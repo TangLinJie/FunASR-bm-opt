@@ -22,6 +22,7 @@ def process():
     print(res)
     print("generate time:", end_time-start_time)
 
+"""
 ps = []
 for _ in range(3):
     p = multiprocessing.Process(target=process)
@@ -30,5 +31,7 @@ for _ in range(3):
 
 for p in ps:
     p.join()
+"""
 
+process()
 

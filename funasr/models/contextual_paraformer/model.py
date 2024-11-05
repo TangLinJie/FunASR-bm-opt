@@ -88,6 +88,8 @@ class ContextualParaformer(Paraformer):
 
         self.encoder_model = EngineOV("./bmodel/asr/encoder_bm1684x_f16_b10.bmodel", device_id=kwargs['dev_id'])
         self.decoder_model = EngineOV("./bmodel/asr/decoder_bm1684x_f32.bmodel", device_id=kwargs['dev_id'])
+        # self.encoder_model = EngineOV("./bm1688_bmodels/asr_1batch/encoder_f32.bmodel", device_id=kwargs['dev_id'])
+        # self.decoder_model = EngineOV("./bm1688_bmodels/asr_1batch/decoder_f32.bmodel", device_id=kwargs['dev_id'])
 
     def forward(
         self,
